@@ -20,7 +20,10 @@ import cdflib
 from scipy.ndimage import gaussian_filter1d
 from datetime import datetime, timedelta, timezone
 import concurrent.futures
-import resource
+try:
+	import resource
+except ImportError:
+	resource = None  # Windows fallback
 from multiprocessing import Manager
 from rich.live import Live
 from rich.table import Table
@@ -28,9 +31,13 @@ from rich.panel import Panel
 
 # --- Path Setup ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
-psp_root = os.path.dirname(current_dir)
-if psp_root not in sys.path:
-	sys.path.insert(0, psp_root)
+waveAnalysis_root = os.path.dirname(current_dir)
+python_root = os.path.dirname(waveAnalysis_root)
+	
+# Ensure both current directory and root project directory are in sys.path
+for path in (current_dir, waveAnalysis_root, python_root):
+	if path not in sys.path:
+		sys.path.insert(0, path)
 
 import config
 from core_waves import data_loader, field_aligner, dsp, polarization_means, poynting
@@ -52,21 +59,26 @@ MAG_SC_ROOT   = os.path.join(SPP_CACHE_ROOT, 'fields/l2/mag_SC')
 EFIELD_ROOT   = os.path.join(SPP_CACHE_ROOT, 'fields/l2/dfb_wf_dvdc')
 
 def limit_memory(max_gb):
-	"""Sets a hard limit on the RAM this specific Python process can use."""
+	"""Sets a hard limit on the RAM this specific Python process can use (Unix only)."""
+	if resource is None:
+		return  # Memory limits not enforced natively on Windows
 	max_bytes = int(max_gb * 1024 * 1024 * 1024)
 	soft, hard = resource.getrlimit(resource.RLIMIT_AS)
 	resource.setrlimit(resource.RLIMIT_AS, (max_bytes, hard))
 	
 def set_terminal_tab_title(title_text):
-	"""Writes OSC escape sequences directly to /dev/tty, bypassing
-	sys.stdout and Rich redirection to avoid UI corruption."""
+	"""
+	Sets the terminal tab/window title natively across OSs without 
+	corrupting Rich stdout/Live rendering buffers.
+	"""
 	try:
-		if os.name == 'posix':
+		if os.name == 'nt':
+			# Windows: Native Win32 API call (bypasses stdout entirely)
+			import ctypes
+			ctypes.windll.kernel32.SetConsoleTitleW(title_text)
+		else:
+			# Unix/Linux: Write directly to /dev/tty so Rich stdout redirection ignores it
 			with open('/dev/tty', 'w') as tty:
-				tty.write(f"\033]0;{title_text}\007")
-				tty.flush()
-		elif os.name == 'nt':
-			with open('CON', 'w') as tty:
 				tty.write(f"\033]0;{title_text}\007")
 				tty.flush()
 	except Exception:
@@ -74,15 +86,23 @@ def set_terminal_tab_title(title_text):
 		
 def load_auth_credentials(auth_path=None):
 	"""
-	Loads PSP FIELDS HTTP Basic Auth credentials from ~/MyDrive/.auth.
-	Looks specifically for 'psp_flds_username' and 'psp_flds_password'.
+	Loads PSP FIELDS HTTP Basic Auth credentials.
+	Searches ~/MyDrive/.auth, ~/.auth, and DRIVE_ROOT/.auth.
 	"""
 	if auth_path is None:
-		auth_path = os.path.expanduser('~/MyDrive/.auth')
-		
-	if not os.path.exists(auth_path):
+		possible_paths = [
+			os.path.expanduser('~/MyDrive/.auth'),
+			os.path.expanduser('~/.auth'),
+			os.path.join(DRIVE_ROOT, '.auth')
+		]
+		for p in possible_paths:
+			if os.path.exists(p):
+				auth_path = p
+				break
+
+	if not auth_path or not os.path.exists(auth_path):
 		return None
-		
+
 	creds = {}
 	try:
 		with open(auth_path, 'r') as f:
@@ -91,10 +111,10 @@ def load_auth_credentials(auth_path=None):
 				if line and '=' in line and not line.startswith('#'):
 					k, v = line.split('=', 1)
 					creds[k.strip()] = v.strip()
-					
+
 		user = creds.get('psp_flds_username')
 		passwd = creds.get('psp_flds_password')
-		
+
 		return (user, passwd) if user and passwd else None
 	except Exception:
 		return None
@@ -292,8 +312,12 @@ def process_chunk(chunk_tuple, slot_queue, status_queue, log_queue):
 		log_queue.put(msg)
 
 	def update_ui(status_text):
-		peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-		ram_str = f"{peak_kb / (1024 * 1024):.2f} GB"
+		if resource is not None:
+			peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+			ram_str = f"{peak_kb / (1024 * 1024):.2f} GB"
+		else:
+			ram_str = "N/A (Win)"
+			
 		status_queue.put({
 			'slot_id': slot_id, 'date': date_str, 'chunk': chunk_str,
 			'status': status_text, 'ram': ram_str
@@ -532,7 +556,7 @@ def process_chunk(chunk_tuple, slot_queue, status_queue, log_queue):
 		# --- 8. AUTOMATIC SUBPROCESS PLOTTER ---
 		if params['plotStuff']:
 			update_ui("Plotting Spectrogram")
-			plotter_script = os.path.join(psp_root, 'PSP', 'psp_waveAnalysis_plotter.py')
+			plotter_script = os.path.join(waveAnalysis_root, 'psp_waveAnalysis_plotter.py')
 			start_str = start_dt.strftime('%Y-%m-%d %H:%M')
 			end_str = end_dt.strftime('%Y-%m-%d %H:%M')
 			
