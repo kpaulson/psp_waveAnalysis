@@ -5,9 +5,9 @@ def Hanningfft(ds, fs, freq_min, freq_max, window, slide):
     """
     FFT routine employing a sliding Hanning window function.
     
-    The divisor 1.732 (sqrt(3)) is the theoretical Power Spectral Density (PSD) energy 
-    correction factor required to compensate for the Equivalent Noise Bandwidth (ENBW) 
-    of the Hanning window.
+    Dividing by sqrt(0.75) (~0.8660) compensates for SciPy's 1/sum(w) STFT normalization
+    and Hann window power loss so that integral(PSD * df) equals true time-domain variance
+    (Parseval's theorem) when PSD = |FFT|^2.
     
     Parameters:
         ds       = The 1D time-series input data.
@@ -43,9 +43,8 @@ def Hanningfft(ds, fs, freq_min, freq_max, window, slide):
     # SciPy outputs shape (Freq, Time). Transpose to (Time, Freq) to match your workflow.
     waveform_fft = waveform_fft.T
     
-    # Apply your specific PSD energy correction factor for the Hanning window 
-    # to perfectly match your old Jython output amplitudes.
-    waveform_fft = waveform_fft * np.sqrt(window / fs) / 1.732
+    # Parseval-exact normalization for SciPy one-sided Hann STFT with PSD = |FFT|^2
+    waveform_fft = waveform_fft * np.sqrt(window / fs) / np.sqrt(0.75)
     
     # Identify the frequency range to keep
     valid_freqs = (frequency_axis >= freq_min) & (frequency_axis <= freq_max)

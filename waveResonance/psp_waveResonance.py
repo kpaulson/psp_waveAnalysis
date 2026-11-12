@@ -351,10 +351,11 @@ def process_day(day_tuple, slot_queue, status_queue, log_queue):
                     wave_file, mag_file, csv_path, start_dt, end_dt, LFR_DENSITY_FILE
                 )
                 
-                power_e_clean = np.where(d_out['Power_E'] > 0, d_out['Power_E'], np.nan)
-                if np.all(np.isnan(power_e_clean)):
-                    if args.verbose: print(f"  [!] Skipping {chunk_str}: Power_E is 100% invalid")
-                    continue
+                # REMOVED - was filtering data based on efield availability
+                #power_e_clean = np.where(d_out['Power_E'] > 0, d_out['Power_E'], np.nan)
+                #if np.all(np.isnan(power_e_clean)):
+                #    if args.verbose: print(f"  [!] Skipping {chunk_str}: Power_E is 100% invalid")
+                #    continue
                 
                 # 2. Fetch SPICE Data
                 cmat, V_sc_RTN = spice_manager.get_spice_data(d_out['Time'])
@@ -386,7 +387,7 @@ def process_day(day_tuple, slot_queue, status_queue, log_queue):
                 # 6. Process Integrated Parameters & Masks
                 int_LH, int_RH, int_Sn_pos, int_Sn_neg, mask_LH, mask_RH, mask_Sn_pos, mask_Sn_neg = kinematics.calculate_integrated_powers(
                     d_out['f_sc'], d_out['Power_B'], d_out['S_n'], 
-                    d_out['coherency_B'], d_out['ellipticity_B'], k_parallel, k_mag
+                    d_out['coherency_B'], d_out['ellipticity_B'], d_out['k_n']
                 )
                 
                 # 7. Apply Coherency Mask

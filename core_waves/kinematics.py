@@ -59,12 +59,12 @@ def calculate_alfven_velocity(B0_mag, N_p, N_alpha, nominal_alpha_ratio=0.04):
         
     return v_A / 1000.0
 
-def calculate_integrated_powers(f_sc, Wave_Power, S_n, coh, ell, k_parallel, k_mag):
+def calculate_integrated_powers(f_sc, Wave_Power, S_n, coh, ell, k_hat_n):
     f_1d = f_sc[0, :] if f_sc.ndim == 2 else f_sc
     df = np.mean(np.diff(f_1d))
     
     with np.errstate(divide='ignore', invalid='ignore'):
-        cos_theta = np.clip(np.abs(k_parallel) / k_mag, -1.0, 1.0)
+        cos_theta = np.clip(np.abs(k_hat_n), 0.0, 1.0)
         theta_k = np.degrees(np.arccos(cos_theta))
         
     def smooth2d(arr, size=(2, 20)):
@@ -87,7 +87,9 @@ def calculate_integrated_powers(f_sc, Wave_Power, S_n, coh, ell, k_parallel, k_m
     
     int_LH = np.nansum(np.where(mask_LH, Wave_Power, 0.0), axis=1) * df
     int_RH = np.nansum(np.where(mask_RH, Wave_Power, 0.0), axis=1) * df
-    int_Sn_pos = np.nansum(np.where(mask_Sn_pos, S_n, 0.0), axis=1) * df
-    int_Sn_neg = np.nansum(np.where(mask_Sn_neg, S_n, 0.0), axis=1) * df
+
+    has_S = np.any(np.isfinite(S_n), axis=1)
+    int_Sn_pos = np.where(has_S, np.nansum(np.where(mask_Sn_pos, S_n, 0.0), axis=1) * df, np.nan)
+    int_Sn_neg = np.where(has_S, np.nansum(np.where(mask_Sn_neg, S_n, 0.0), axis=1) * df, np.nan)
     
     return int_LH, int_RH, int_Sn_pos, int_Sn_neg, mask_LH, mask_RH, mask_Sn_pos, mask_Sn_neg

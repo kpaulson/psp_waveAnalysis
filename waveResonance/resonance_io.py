@@ -189,13 +189,17 @@ def fetch_wave_data(wave_file):
     data = {}
     print(f"    -> Loading Wave Analysis Data {io_message}...")
     with smart_cdf(wave_file) as cdf_w:
+        zvars = cdf_w.cdf_info().zVariables
         data['f_sc']          = cdf_w.varget('frequencies')
-        data['Power_E']       = cdf_w.varget('wave_power_E')
         data['Power_B']       = cdf_w.varget('wave_power_B')
         data['Power_B_para']  = cdf_w.varget('B_power_para')
+        data['Power_E']       = cdf_w.varget('wave_power_E') if 'wave_power_E' in zvars else np.full_like(data['Power_B'], np.nan)
         
-        S_vec                 = cdf_w.varget('S_fieldAligned')
-        data['S_n']           = S_vec[..., 0] 
+        if 'S_fieldAligned' in zvars:
+            S_vec             = cdf_w.varget('S_fieldAligned')
+            data['S_n']       = S_vec[..., 0]
+        else:
+            data['S_n']       = np.full_like(data['Power_B'], np.nan)
         
         k_vec                 = cdf_w.varget('k_hat_fieldAligned')
         data['k_n']           = k_vec[..., 0]
