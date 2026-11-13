@@ -17,11 +17,15 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 
-# Look up one level to find config and shared modules
+# --- Path Setup ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
+waveAnalysis_root = os.path.dirname(current_dir)
+python_root = os.path.dirname(waveAnalysis_root)
+	
+# Ensure both current directory and root project directory are in sys.path
+for path in (current_dir, waveAnalysis_root, python_root):
+	if path not in sys.path:
+		sys.path.insert(0, path)
 
 import config
 import resonance_io
@@ -32,9 +36,19 @@ DRIVE_ROOT           = config.get_drive_path()
 PSP_SHAREDDRIVE_ROOT = config.get_sharedDrivePSP_path()
 SCI_ROOT             = config.get_berkeleyCacheData()
 
-MAG_4SA_ROOT  = f'{SCI_ROOT}/fields/l2/mag_SC_4_Sa_per_Cyc/'
-CSV_ROOT      = f'{PSP_SHAREDDRIVE_ROOT}/15min_DATA_Internal/_CURRENT_20260604/' 
-TMP_ROOT      = f'{DRIVE_ROOT}/tmp/'
+def get_latest_sweap_csv_dir(shared_drive_root):
+    base_dir = os.path.join(shared_drive_root, '15min_DATA_Internal')
+    candidates = sorted([
+        d for d in glob.glob(os.path.join(base_dir, '_CURRENT_*'))
+        if os.path.isdir(d)
+    ])
+    if not candidates:
+        raise FileNotFoundError(f"No _CURRENT_* directory found in {base_dir}")
+    return candidates[-1]
+
+MAG_4SA_ROOT     = f'{SCI_ROOT}/fields/l2/mag_SC_4_Sa_per_Cyc/'
+CSV_ROOT         = get_latest_sweap_csv_dir(PSP_SHAREDDRIVE_ROOT)
+TMP_ROOT         = f'{DRIVE_ROOT}/tmp/'
 LFR_DENSITY_FILE = f'{DRIVE_ROOT}/Research/PSP/FIELDS/LFR_Density/spp_fld_lfr_mission_density.cdf'
 
 class QueueLogger:
@@ -62,7 +76,9 @@ def get_masked_weighted_avg(data_2d, mask_2d, power_2d):
         sum_weights = np.nansum(weights, axis=1)
         return np.where(sum_weights > 0, weighted_sum / sum_weights, np.nan)
 
-def smooth_mask(arr, size=(2, 20)):
+def smooth_mask(arr, df=None, target_bw_hz=1.25):
+    n_freq = max(3, int(round(target_bw_hz / df))) if (df is not None and df > 0) else 20
+    size = (2, n_freq)
     valid_mask = np.isfinite(arr).astype(float)
     arr_filled = np.where(np.isfinite(arr), arr, 0.0)
     s_arr = ndimage.uniform_filter(arr_filled, size=size, mode='nearest')
@@ -391,7 +407,8 @@ def process_day(day_tuple, slot_queue, status_queue, log_queue):
                 )
                 
                 # 7. Apply Coherency Mask
-                coh_smoothed = smooth_mask(d_out['coherency_B'])
+                df_chunk = np.mean(np.diff(d_out['f_sc'][0, :]))
+                coh_smoothed = smooth_mask(d_out['coherency_B'], df=df_chunk)
                 valid_wave_mask = coh_smoothed >= 0.5
                 
                 E_res_p          = np.where(valid_wave_mask, E_res_p, np.nan)

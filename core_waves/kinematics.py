@@ -59,15 +59,16 @@ def calculate_alfven_velocity(B0_mag, N_p, N_alpha, nominal_alpha_ratio=0.04):
         
     return v_A / 1000.0
 
-def calculate_integrated_powers(f_sc, Wave_Power, S_n, coh, ell, k_hat_n):
+def calculate_integrated_powers(f_sc, Wave_Power, S_n, coh, ell, k_hat_n, target_bw_hz=1.25):
     f_1d = f_sc[0, :] if f_sc.ndim == 2 else f_sc
     df = np.mean(np.diff(f_1d))
+    n_freq_bins = max(3, int(round(target_bw_hz / df)))
     
     with np.errstate(divide='ignore', invalid='ignore'):
         cos_theta = np.clip(np.abs(k_hat_n), 0.0, 1.0)
         theta_k = np.degrees(np.arccos(cos_theta))
         
-    def smooth2d(arr, size=(2, 20)):
+    def smooth2d(arr, size=(4, n_freq_bins)):
         valid_mask = np.isfinite(arr).astype(float)
         arr_filled = np.where(np.isfinite(arr), arr, 0.0)
         s_arr = ndimage.uniform_filter(arr_filled, size=size, mode='nearest')
@@ -87,6 +88,9 @@ def calculate_integrated_powers(f_sc, Wave_Power, S_n, coh, ell, k_hat_n):
     
     int_LH = np.nansum(np.where(mask_LH, Wave_Power, 0.0), axis=1) * df
     int_RH = np.nansum(np.where(mask_RH, Wave_Power, 0.0), axis=1) * df
+    
+    int_LH = np.where(np.sum(mask_LH, axis=1) >= 2, int_LH, 0.0)
+    int_RH = np.where(np.sum(mask_RH, axis=1) >= 2, int_RH, 0.0)
 
     has_S = np.any(np.isfinite(S_n), axis=1)
     int_Sn_pos = np.where(has_S, np.nansum(np.where(mask_Sn_pos, S_n, 0.0), axis=1) * df, np.nan)
