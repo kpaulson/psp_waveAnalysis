@@ -3,6 +3,7 @@ import os
 import glob
 import warnings
 from datetime import datetime, timedelta, timezone
+import json
 import numpy as np
 import sys
 import gc
@@ -492,6 +493,44 @@ def process_day(day_tuple, slot_queue, status_queue, log_queue):
         gc.collect()
         slot_queue.put(slot_id) # Release worker slot back to pool
 
+def _write_live_state(state_path, payload):
+    try:
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        tmp = state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, state_path)
+    except Exception:
+        pass
+
+
+def _write_manual_resonance_log(start_dt, succeeded_days, error_msgs, aborted=False):
+    if os.environ.get("WAVE_CRON_WRAPPER") == "1":
+        return
+    import socket
+    log_dir = "/home/kpaulson/logs/waveResonance"
+    os.makedirs(log_dir, exist_ok=True)
+    host = socket.gethostname()
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_file = os.path.join(log_dir, f"waveResonance_{host}_{today}.log")
+
+    days_ok = sorted(list(set(succeeded_days)))
+    try:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write("======================================================================\n")
+            f.write(f"RUN INITIATED (Manual CLI): {start_dt.strftime('%a %b %d %I:%M:%S %p %Z %Y')}\n")
+            f.write(f"Processed {len(days_ok)} day(s)\n")
+            f.write("----------------------------------------------------------------------\n")
+            for d_str in days_ok:
+                f.write(f"[SUCCESS] Processed and synced {d_str} smoothly.\n")
+            for err in error_msgs[-50:]:
+                f.write(f"{err}\n")
+            end_label = "Resonance batch ABORTED" if aborted else "Resonance batch completed successfully"
+            f.write(f"{end_label} at {datetime.now().strftime('%a %b %d %I:%M:%S %p %Z %Y')}!\n")
+            f.write("======================================================================\n\n")
+    except Exception:
+        pass
+
 def main():
     args = setup()
     
@@ -567,52 +606,103 @@ def main():
         
     worker_states = {i: {'date': 'Idle', 'chunk': '-', 'status': 'Idle', 'ram': '-'} for i in range(args.workers)}
 
-    # Run Process Pool + Live Dashboard Event Loop
+    state_path = "/home/kpaulson/logs/waveResonance/live_state.json"
+    run_start_dt = datetime.now()
+    last_state_flush = 0.0
+    succeeded_days = []
+    error_msgs = []
+
+    _write_live_state(state_path, {
+        "state": "running",
+        "pid": os.getpid(),
+        "started_at": run_start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": run_start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "completed": 0,
+        "total": total_days,
+        "unit": "days",
+        "error_count": 0,
+        "workers": {}
+    })
+
     try:
-        with Live(make_dashboard(worker_states, 0, total_days), refresh_per_second=4) as live:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
-                
-                futures = {
-                    executor.submit(process_day, task, slot_queue, status_queue, log_queue): task 
-                    for task in day_tasks
-                }
-                
-                completed_futures = set()
-                last_completed = -1
+        with Live(make_layout(), refresh_per_second=4, console=console) as live:
+            while completed_days < total_days:
+                while not log_queue.empty():
+                    try:
+                        msg = log_queue.get_nowait()
+                        log_messages.append(msg)
+                        if any(k in msg for k in ("[ERROR]", "Traceback", "Exception", "Failed", "Error")):
+                            error_msgs.append(msg)
+                    except queue.Empty:
+                        break
 
-                while completed_days < total_days:
-                    # 1. Print worker logs safely above the dashboard table
-                    while not log_queue.empty():
-                        msg = log_queue.get()
-                        live.console.print(msg)
+                while not status_queue.empty():
+                    try:
+                        wid, date_str, stat_str = status_queue.get_nowait()
+                        worker_states[wid] = {
+                            "date": date_str,
+                            "chunk": "full-day",
+                            "status": stat_str
+                        }
+                    except queue.Empty:
+                        break
 
-                    # 2. Update dashboard table state
-                    while not status_queue.empty():
-                        msg = status_queue.get()
-                        slot = msg['slot_id']
-                        worker_states[slot].update(msg)
+                done_futs = [f for f in list(futures.keys()) if f.done()]
+                for f in done_futs:
+                    day_dt = futures.pop(f)
+                    completed_days += 1
+                    progress.advance(overall_task, 1)
+                    try:
+                        f.result()
+                        succeeded_days.append(day_dt.strftime("%Y-%m-%d"))
+                    except Exception as exc:
+                        err_line = f"[ERROR] Day {day_dt.strftime('%Y-%m-%d')}: {exc}"
+                        log_messages.append(err_line)
+                        error_msgs.append(err_line)
 
-                    # 3. Harvest completed day tasks
-                    done = [f for f in futures if f.done() and f not in completed_futures]
-                    for f in done:
-                        completed_futures.add(f)
-                        completed_days += 1
-                    
-                    # --- TABBY LIVE TAB TITLE UPDATE (DIRECT TTY) ---
-                    if completed_days != last_completed:
-                        last_completed = completed_days
-                        pct = int((completed_days / total_days) * 100)
-                        set_terminal_tab_title(f"[{pct}%] WaveResonance ({completed_days}/{total_days} Days)")
+                now_ts = time.time()
+                if (now_ts - last_state_flush) >= 2.0:
+                    _write_live_state(state_path, {
+                        "state": "running",
+                        "pid": os.getpid(),
+                        "started_at": run_start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "completed": completed_days,
+                        "total": total_days,
+                        "unit": "days",
+                        "error_count": len(error_msgs),
+                        "workers": {str(k): v for k, v in worker_states.items()}
+                    })
+                    last_state_flush = now_ts
 
-                    live.update(make_dashboard(worker_states, completed_days, total_days))
-                    time.sleep(0.1)
+                live.update(make_layout())
+                time.sleep(0.1)
 
     except KeyboardInterrupt:
-        set_terminal_tab_title("[ABORTED] WaveResonance")
-        print("\n\n[!] KeyboardInterrupt detected! Force-killing worker pool and releasing memory...")
+        console.print("\n[bold red]Interrupted by user! Shutting down workers...[/bold red]")
         executor.shutdown(wait=False, cancel_futures=True)
-        manager.shutdown()
-        sys.exit(1)
+        _write_live_state(state_path, {
+            "state": "idle",
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "completed": completed_days,
+            "total": total_days,
+            "unit": "days",
+            "error_count": len(error_msgs),
+            "workers": {}
+        })
+        _write_manual_resonance_log(run_start_dt, succeeded_days, error_msgs, aborted=True)
+    else:
+        executor.shutdown(wait=True)
+        _write_live_state(state_path, {
+            "state": "idle",
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "completed": completed_days,
+            "total": total_days,
+            "unit": "days",
+            "error_count": len(error_msgs),
+            "workers": {}
+        })
+        _write_manual_resonance_log(run_start_dt, succeeded_days, error_msgs, aborted=False)
 
     # --- TABBY COMPLETION NOTIFICATION & TERMINAL BELL ---
     try:

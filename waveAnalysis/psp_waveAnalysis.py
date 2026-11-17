@@ -14,6 +14,7 @@ import base64
 import gc
 import subprocess
 import time
+import json
 import numpy as np
 import pandas as pd
 import cdflib
@@ -583,6 +584,43 @@ def process_chunk(chunk_tuple, slot_queue, status_queue, log_queue):
 	finally:
 		gc.collect()
 		slot_queue.put(slot_id)
+		
+def _write_live_state(state_path, payload):
+    try:
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        tmp = state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, state_path)
+    except Exception:
+        pass
+
+def _write_manual_run_log(job_name, start_dt, completed_tasks, error_msgs, aborted=False):
+    if os.environ.get("WAVE_CRON_WRAPPER") == "1":
+        return
+    import socket
+    log_dir = f"/home/kpaulson/logs/{job_name}"
+    os.makedirs(log_dir, exist_ok=True)
+    host = socket.gethostname()
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_file = os.path.join(log_dir, f"{job_name}_{host}_{today}.log")
+
+    days_ok = sorted(list(set(t[0].strftime("%Y-%m-%d") for t in completed_tasks)))
+    try:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write("======================================================================\n")
+            f.write(f"RUN INITIATED (Manual CLI): {start_dt.strftime('%a %b %d %I:%M:%S %p %Z %Y')}\n")
+            f.write(f"Processed {len(completed_tasks)} chunk(s) across {len(days_ok)} day(s)\n")
+            f.write("----------------------------------------------------------------------\n")
+            for d_str in days_ok:
+                f.write(f"[SUCCESS] Processed and synced {d_str} smoothly.\n")
+            for err in error_msgs[-50:]:
+                f.write(f"{err}\n")
+            end_label = "Wave generation batch ABORTED" if aborted else "Wave generation batch completed successfully"
+            f.write(f"{end_label} at {datetime.now().strftime('%a %b %d %I:%M:%S %p %Z %Y')}!\n")
+            f.write("======================================================================\n\n")
+    except Exception:
+        pass
 
 def main():
 	params = setup()
@@ -640,49 +678,107 @@ def main():
 	executor = concurrent.futures.ProcessPoolExecutor(max_workers=params['workers'])
 	last_completed = -1
 
-	try:
-		with Live(make_dashboard(worker_states, 0, total_chunks), refresh_per_second=4) as live:
-			futures = {
-				executor.submit(process_chunk, task, slot_queue, status_queue, log_queue): task 
-				for task in chunk_tasks
-			}
-			
-			completed_futures = set()
-			while completed_chunks < total_chunks:
-				while not log_queue.empty():
-					msg = log_queue.get()
-					live.console.print(msg)
+	state_path = "/home/kpaulson/logs/waveAnalysis/live_state.json"
+    run_start_dt = datetime.now()
+    last_state_flush = 0.0
+    succeeded_tasks = []
+    error_msgs = []
 
-				while not status_queue.empty():
-					msg = status_queue.get()
-					slot = msg['slot_id']
-					worker_states[slot].update(msg)
+    _write_live_state(state_path, {
+        "state": "running",
+        "pid": os.getpid(),
+        "started_at": run_start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": run_start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "completed": 0,
+        "total": total_chunks,
+        "unit": "chunks",
+        "error_count": 0,
+        "workers": {}
+    })
 
-				done = [f for f in futures if f.done() and f not in completed_futures]
-				for f in done:
-					completed_futures.add(f)
-					completed_chunks += 1
+    try:
+        with Live(make_layout(), refresh_per_second=4, console=console) as live:
+            while completed_chunks < total_chunks:
+                # Drain log messages
+                while not log_queue.empty():
+                    try:
+                        msg = log_queue.get_nowait()
+                        log_messages.append(msg)
+                        if any(k in msg for k in ("[ERROR]", "Traceback", "Exception", "Failed", "Error")):
+                            error_msgs.append(msg)
+                    except queue.Empty:
+                        break
 
-				if completed_chunks != last_completed:
-					last_completed = completed_chunks
-					pct = int((completed_chunks / total_chunks) * 100)
-					set_terminal_tab_title(f"[{pct}%] WaveAnalysis ({completed_chunks}/{total_chunks})")
+                # Drain worker status updates
+                while not status_queue.empty():
+                    try:
+                        wid, date_str, chunk_str, stat_str = status_queue.get_nowait()
+                        worker_states[wid] = {
+                            "date": date_str,
+                            "chunk": chunk_str,
+                            "status": stat_str
+                        }
+                    except queue.Empty:
+                        break
 
-				live.update(make_dashboard(worker_states, completed_chunks, total_chunks))
-				time.sleep(0.1)
+                # Check finished futures
+                done_futs = [f for f in list(futures.keys()) if f.done()]
+                for f in done_futs:
+                    task_info = futures.pop(f)
+                    completed_chunks += 1
+                    progress.advance(overall_task, 1)
+                    try:
+                        f.result()
+                        succeeded_tasks.append(task_info)
+                    except Exception as exc:
+                        err_line = f"[ERROR] Task {task_info}: {exc}"
+                        log_messages.append(err_line)
+                        error_msgs.append(err_line)
 
-	except KeyboardInterrupt:
-		set_terminal_tab_title("[ABORTED] WaveAnalysis")
-		print("\n\n[!] KeyboardInterrupt detected! Force-killing worker pool and releasing memory...")
-		executor.shutdown(wait=False, cancel_futures=True)
-		manager.shutdown()
-		sys.exit(1)
+                # Flush live_state.json every ~2 seconds
+                now_ts = time.time()
+                if (now_ts - last_state_flush) >= 2.0:
+                    _write_live_state(state_path, {
+                        "state": "running",
+                        "pid": os.getpid(),
+                        "started_at": run_start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "completed": completed_chunks,
+                        "total": total_chunks,
+                        "unit": "chunks",
+                        "error_count": len(error_msgs),
+                        "workers": {str(k): v for k, v in worker_states.items()}
+                    })
+                    last_state_flush = now_ts
 
-	else:
-		executor.shutdown(wait=True)
-		manager.shutdown()
-		set_terminal_tab_title("[DONE] WaveAnalysis Complete!")
-		print("\n[+] Multiprocessing execution complete.")
+                live.update(make_layout())
+                time.sleep(0.1)
+
+    except KeyboardInterrupt:
+        console.print("\n[bold red]Interrupted by user! Shutting down workers...[/bold red]")
+        executor.shutdown(wait=False, cancel_futures=True)
+        _write_live_state(state_path, {
+            "state": "idle",
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "completed": completed_chunks,
+            "total": total_chunks,
+            "unit": "chunks",
+            "error_count": len(error_msgs),
+            "workers": {}
+        })
+        _write_manual_run_log("waveAnalysis", run_start_dt, succeeded_tasks, error_msgs, aborted=True)
+    else:
+        executor.shutdown(wait=True)
+        _write_live_state(state_path, {
+            "state": "idle",
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "completed": completed_chunks,
+            "total": total_chunks,
+            "unit": "chunks",
+            "error_count": len(error_msgs),
+            "workers": {}
+        })
+        _write_manual_run_log("waveAnalysis", run_start_dt, succeeded_tasks, error_msgs, aborted=False)
 
 def setup():
 	parser = argparse.ArgumentParser(description="Multi-Mission Level 3 WaveAnalysis Pipeline (Python 3)")
