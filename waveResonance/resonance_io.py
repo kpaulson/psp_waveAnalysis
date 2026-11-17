@@ -84,16 +84,12 @@ def read_2d_waveResonance_cdf(cdf_path):
 
 @contextmanager
 def managed_waveResonance_cdf(output_path, v_out, source_wave_file, source_mag_file, data_type, logical_source):
-    """Context manager to handle boilerplate CDF creation, global attributes, and OS file locks."""
-    is_windows = (platform.system() == 'Windows')
-    if is_windows:
-        working_path = os.path.join(tempfile.gettempdir(), os.path.basename(output_path))
-    else:
-        working_path = output_path
+    """Context manager to handle boilerplate CDF creation, global attributes, and atomic writes."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    working_path = f"{output_path}.tmp.{os.getpid()}"
+    if os.path.exists(working_path):
+        os.remove(working_path)
 
-    if os.path.exists(working_path): os.remove(working_path)
-    os.makedirs(os.path.dirname(working_path), exist_ok=True)
-    
     cdf = cdflib.cdfwrite.CDF(working_path)
     
     file_name_no_ext = os.path.splitext(os.path.basename(output_path))[0]
@@ -156,13 +152,19 @@ def managed_waveResonance_cdf(output_path, v_out, source_wave_file, source_mag_f
             'Rec_Vary': (name != 'frequencies'), 'Dim_Sizes': dims, 'Data': data 
         }, var_attrs=var_attrs, var_data=data)
 
+    write_ok = False
     try:
         yield cdf, add_var
+        write_ok = True
     finally:
         cdf.close()
-        if is_windows:
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            shutil.move(working_path, output_path)
+        if write_ok and os.path.exists(working_path):
+            os.replace(working_path, output_path)
+        elif os.path.exists(working_path):
+            try:
+                os.remove(working_path)
+            except OSError:
+                pass
 
 def load_smart_csv(csv_path):
     """Safely copies, parses, and cleans the SWEAP CSV."""

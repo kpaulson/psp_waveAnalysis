@@ -13,16 +13,11 @@ def managed_waveAnalysis_cdf(output_path, v_out, source_mag_file, source_efield_
 	Context manager to handle boilerplate CDF creation, global attributes, 
 	and OS file locks for the v1.4 Wave Analysis pipeline.
 	"""
-	is_windows = (platform.system() == 'Windows')
-	if is_windows:
-		working_path = os.path.join(tempfile.gettempdir(), os.path.basename(output_path))
-	else:
-		working_path = output_path
-
-	if os.path.exists(working_path): 
+	os.makedirs(os.path.dirname(output_path), exist_ok=True)
+	working_path = f"{output_path}.tmp.{os.getpid()}"
+	if os.path.exists(working_path):
 		os.remove(working_path)
-	os.makedirs(os.path.dirname(working_path), exist_ok=True)
-	
+
 	cdf = cdflib.cdfwrite.CDF(working_path)
 	
 	# Determine metadata string dynamically based on type
@@ -97,13 +92,19 @@ def managed_waveAnalysis_cdf(output_path, v_out, source_mag_file, source_efield_
 		}, var_attrs=var_attrs, var_data=data)
 
 	# --- YIELD TO WRITER ---
+	write_ok = False
 	try:
 		yield cdf, add_var
+		write_ok = True
 	finally:
 		cdf.close()
-		if is_windows:
-			os.makedirs(os.path.dirname(output_path), exist_ok=True)
-			shutil.move(working_path, output_path)
+		if write_ok and os.path.exists(working_path):
+			os.replace(working_path, output_path)
+		elif os.path.exists(working_path):
+			try:
+				os.remove(working_path)
+			except OSError:
+				pass
 
 def write_waveAnalysis_cdf(output_path, data, v_out, source_mag_file, source_efield_file, logy=True, verbose=False):
 	"""

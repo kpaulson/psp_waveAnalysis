@@ -11,6 +11,9 @@ import scipy.ndimage as ndimage
 import concurrent.futures
 import resource
 import time
+import signal
+import queue
+from collections import deque
 from multiprocessing import Manager
 from contextlib import redirect_stdout
 from rich.live import Live
@@ -531,6 +534,10 @@ def _write_manual_resonance_log(start_dt, succeeded_days, error_msgs, aborted=Fa
     except Exception:
         pass
 
+def _worker_init():
+    # Prevent Ctrl+C in the terminal from killing workers mid-CDF write
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
 def main():
     args = setup()
     
@@ -607,10 +614,27 @@ def main():
     worker_states = {i: {'date': 'Idle', 'chunk': '-', 'status': 'Idle', 'ram': '-'} for i in range(args.workers)}
 
     state_path = "/home/kpaulson/logs/waveResonance/live_state.json"
+    stop_flag_path = "/home/kpaulson/logs/waveResonance/STOP"
     run_start_dt = datetime.now()
     last_state_flush = 0.0
     succeeded_days = []
     error_msgs = []
+
+    draining = False
+    force_abort = False
+    pending_days = deque(day_tasks)
+
+    def _handle_stop_signal(signum, frame):
+        nonlocal draining, force_abort
+        if not draining:
+            draining = True
+            pending_days.clear()
+            log_queue.put("[yellow]Drain requested: finishing active days, skipping remaining queue...[/yellow]")
+        else:
+            force_abort = True
+
+    signal.signal(signal.SIGINT, _handle_stop_signal)
+    signal.signal(signal.SIGTERM, _handle_stop_signal)
 
     _write_live_state(state_path, {
         "state": "running",
@@ -624,41 +648,62 @@ def main():
         "workers": {}
     })
 
+    executor = concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=_worker_init)
+    futures = {}
+
     try:
-        with Live(make_layout(), refresh_per_second=4, console=console) as live:
-            while completed_days < total_days:
+        with Live(make_dashboard(worker_states, completed_days, total_days), refresh_per_second=4) as live:
+            while (pending_days or futures) and not force_abort:
+                if not draining and os.path.exists(stop_flag_path):
+                    draining = True
+                    pending_days.clear()
+                    log_queue.put("[yellow]STOP file detected: finishing active days...[/yellow]")
+                    try:
+                        os.remove(stop_flag_path)
+                    except OSError:
+                        pass
+
+                while not draining and pending_days and len(futures) < args.workers:
+                    day_item = pending_days.popleft()
+                    fut = executor.submit(process_day, day_item, slot_queue, status_queue, log_queue)
+                    futures[fut] = day_item
+
                 while not log_queue.empty():
                     try:
                         msg = log_queue.get_nowait()
-                        log_messages.append(msg)
-                        if any(k in msg for k in ("[ERROR]", "Traceback", "Exception", "Failed", "Error")):
+                        live.console.print(msg)
+                        if any(k in msg for k in ("[ERROR]", "[!]", "Traceback", "Exception", "Failed", "Error")):
                             error_msgs.append(msg)
                     except queue.Empty:
                         break
 
                 while not status_queue.empty():
                     try:
-                        wid, date_str, stat_str = status_queue.get_nowait()
-                        worker_states[wid] = {
-                            "date": date_str,
-                            "chunk": "full-day",
-                            "status": stat_str
-                        }
+                        st = status_queue.get_nowait()
+                        slot_id = st.get('slot_id')
+                        if slot_id in worker_states:
+                            worker_states[slot_id] = st
                     except queue.Empty:
                         break
 
                 done_futs = [f for f in list(futures.keys()) if f.done()]
                 for f in done_futs:
-                    day_dt = futures.pop(f)
+                    day_info = futures.pop(f)
+                    day_dt = day_info[0]
                     completed_days += 1
-                    progress.advance(overall_task, 1)
                     try:
-                        f.result()
-                        succeeded_days.append(day_dt.strftime("%Y-%m-%d"))
+                        ok = f.result()
+                        if ok:
+                            succeeded_days.append(day_dt.strftime("%Y-%m-%d"))
                     except Exception as exc:
                         err_line = f"[ERROR] Day {day_dt.strftime('%Y-%m-%d')}: {exc}"
-                        log_messages.append(err_line)
+                        live.console.print(err_line)
                         error_msgs.append(err_line)
+
+                effective_total = (completed_days + len(futures)) if draining else total_days
+                pct = (completed_days / effective_total * 100.0) if effective_total > 0 else 0.0
+                prefix = "[DRAINING] " if draining else ""
+                set_terminal_tab_title(f"{prefix}WaveResonance: {completed_days}/{effective_total} ({pct:.1f}%)")
 
                 now_ts = time.time()
                 if (now_ts - last_state_flush) >= 2.0:
@@ -668,41 +713,35 @@ def main():
                         "started_at": run_start_dt.strftime("%Y-%m-%d %H:%M:%S"),
                         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "completed": completed_days,
-                        "total": total_days,
+                        "total": effective_total,
                         "unit": "days",
                         "error_count": len(error_msgs),
-                        "workers": {str(k): v for k, v in worker_states.items()}
+                        "workers": {
+                            str(k): {
+                                "date": v.get("date", "Idle"),
+                                "chunk": v.get("chunk", "-"),
+                                "status": v.get("status", "Idle"),
+                            }
+                            for k, v in worker_states.items()
+                        }
                     })
                     last_state_flush = now_ts
 
-                live.update(make_layout())
+                live.update(make_dashboard(worker_states, completed_days, effective_total))
                 time.sleep(0.1)
-
-    except KeyboardInterrupt:
-        console.print("\n[bold red]Interrupted by user! Shutting down workers...[/bold red]")
-        executor.shutdown(wait=False, cancel_futures=True)
+    finally:
+        executor.shutdown(wait=not force_abort, cancel_futures=True)
+        final_total = (completed_days + len(futures)) if draining else total_days
         _write_live_state(state_path, {
             "state": "idle",
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "completed": completed_days,
-            "total": total_days,
+            "total": final_total,
             "unit": "days",
             "error_count": len(error_msgs),
             "workers": {}
         })
-        _write_manual_resonance_log(run_start_dt, succeeded_days, error_msgs, aborted=True)
-    else:
-        executor.shutdown(wait=True)
-        _write_live_state(state_path, {
-            "state": "idle",
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "completed": completed_days,
-            "total": total_days,
-            "unit": "days",
-            "error_count": len(error_msgs),
-            "workers": {}
-        })
-        _write_manual_resonance_log(run_start_dt, succeeded_days, error_msgs, aborted=False)
+        _write_manual_resonance_log(run_start_dt, succeeded_days, error_msgs, aborted=force_abort)
 
     # --- TABBY COMPLETION NOTIFICATION & TERMINAL BELL ---
     try:
