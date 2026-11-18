@@ -4,6 +4,7 @@ import cdflib
 import tempfile
 import shutil
 import os
+import glob
 import platform
 from contextlib import contextmanager
 from scipy.interpolate import interp1d
@@ -86,9 +87,12 @@ def read_2d_waveResonance_cdf(cdf_path):
 def managed_waveResonance_cdf(output_path, v_out, source_wave_file, source_mag_file, data_type, logical_source):
     """Context manager to handle boilerplate CDF creation, global attributes, and atomic writes."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    working_path = f"{output_path}.tmp.{os.getpid()}"
-    if os.path.exists(working_path):
-        os.remove(working_path)
+    for stale in glob.glob(f"{output_path}.tmp*"):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+    working_path = f"{output_path}.tmp.{os.getpid()}.cdf"
 
     cdf = cdflib.cdfwrite.CDF(working_path)
     
