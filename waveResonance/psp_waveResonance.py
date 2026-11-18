@@ -365,6 +365,15 @@ def process_day(day_tuple, slot_queue, status_queue, log_queue):
                 v_out_dir_2d = os.path.join(ANALYSIS_OUT_ROOT_2D, y, m)
                 out_file_2d = os.path.join(v_out_dir_2d, f"PSP_WaveResonance_2D_{y}-{m}-{d}_{hr_str}00_v{v_2d}.cdf")
 
+                if not mag_file:
+                    if args.verbose:
+                        print(f"  [!] Skipping {chunk_str}: Mag 4Sa file missing")
+                    continue
+
+                csv_path = os.path.join(CSV_ROOT, f"E{enc_num:02d}.csv")
+                if not os.path.exists(csv_path) or not os.path.exists(wave_file):
+                    continue
+
                 # 1. Fetch CDF/CSV Data
                 update_ui("Fetching Data", chunk_str)
                 d_out = resonance_io.fetch_and_align_data(
@@ -540,26 +549,66 @@ def _worker_init():
 
 def main():
     args = setup()
-    
-    try:
-        date_parts = args.date.split(' through ')
-        start_date = datetime.strptime(date_parts[0].strip(), '%Y-%m-%d')
-        end_date   = datetime.strptime(date_parts[1].strip(), '%Y-%m-%d')
-    except Exception as e:
-        print(f"[!] Error parsing --date string: {e}")
+
+    if not args.date and not args.batch_file:
+        print("[!] Error: Must specify either --date or --batch_file.")
         return
 
-    print(f"[*] Commencing Multiprocess Batch Loop: {start_date.strftime('%Y-%m-%d')} -> {end_date.strftime('%Y-%m-%d')}")
-    
-    # --- PRE-FLIGHT SPICE DOWNLOAD ---
-    print("[*] Checking & downloading SPICE kernels for the entire batch window...")
-    
-    spice_days = []
-    curr_dt = start_date
-    while curr_dt <= end_date:
-        spice_days.append(curr_dt)
-        curr_dt += timedelta(days=1)
+    day_tasks = []
+    if args.batch_file:
+        if not os.path.exists(args.batch_file):
+            print(f"[!] Error: Batch file not found: '{args.batch_file}'")
+            return
+        with open(args.batch_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                try:
+                    if ' through ' in line:
+                        s_str, e_str = [p.strip() for p in line.split(' through ', 1)]
+                    else:
+                        s_str = e_str = line
+                    curr = datetime.strptime(s_str[:10], '%Y-%m-%d')
+                    end_d = datetime.strptime(e_str[:10], '%Y-%m-%d')
+                    while curr <= end_d:
+                        day_tasks.append((curr, args))
+                        curr += timedelta(days=1)
+                except Exception as e:
+                    print(f"[!] Warning: Skipping invalid batch line '{line}': {e}")
+    else:
+        try:
+            date_parts = args.date.split(' through ')
+            start_date = datetime.strptime(date_parts[0].strip(), '%Y-%m-%d')
+            end_date   = datetime.strptime(date_parts[1].strip(), '%Y-%m-%d')
+        except Exception as e:
+            print(f"[!] Error parsing --date string: {e}")
+            return
 
+        curr = start_date
+        while curr <= end_date:
+            day_tasks.append((curr, args))
+            curr += timedelta(days=1)
+
+    # Deduplicate and sort chronologically
+    seen_dates = set()
+    unique_tasks = []
+    for dt_obj, a_obj in sorted(day_tasks, key=lambda x: x[0]):
+        d_key = dt_obj.strftime('%Y-%m-%d')
+        if d_key not in seen_dates:
+            seen_dates.add(d_key)
+            unique_tasks.append((dt_obj, a_obj))
+    day_tasks = unique_tasks
+
+    if not day_tasks:
+        print("[!] No valid dates to process.")
+        return
+
+    spice_days = [t[0] for t in day_tasks]
+    print(f"[*] Commencing Multiprocess Batch Loop: {spice_days[0].strftime('%Y-%m-%d')} -> {spice_days[-1].strftime('%Y-%m-%d')} ({len(day_tasks)} unique day(s))")
+
+    # --- PRE-FLIGHT SPICE DOWNLOAD ---
+    print("[*] Checking & downloading SPICE kernels for the batch dates...")
     failed_spice_dates = []
 
     with Progress(
@@ -568,36 +617,23 @@ def main():
         BarColumn(bar_width=40, complete_style="magenta", finished_style="green"),
         TaskProgressColumn(),
         TimeRemainingColumn(),
-        transient=True  # Clears progress bar when done
+        transient=True
     ) as progress:
-        
         spice_task = progress.add_task("Syncing SPICE...", total=len(spice_days))
-        
         for day_dt in spice_days:
             date_str = day_dt.strftime('%Y-%m-%d')
             progress.update(spice_task, description=f"Syncing SPICE: {date_str}")
-            
             try:
-                # Force SPICE manager to verify/download kernels for this daily timestamp
                 spice_manager.get_spice_data(np.array([day_dt.timestamp()]))
             except Exception as e:
                 failed_spice_dates.append((date_str, str(e)))
-                # Prints cleanly above the progress bar without disrupting it
                 progress.console.print(f"[bold red][!] SPICE pre-fetch failed for {date_str}: {e}[/bold red]")
-                
             progress.advance(spice_task)
 
     if failed_spice_dates:
         print(f"[!] Warning: {len(failed_spice_dates)} date(s) had SPICE sync issues (workers will retry on the fly).")
     else:
         print("[+] All SPICE kernels verified and cached locally.\n")
-
-    # Build master list of daily tasks
-    day_tasks = []
-    curr = start_date
-    while curr <= end_date:
-        day_tasks.append((curr, args))
-        curr += timedelta(days=1)
 
     total_days = len(day_tasks)
     completed_days = 0
@@ -650,6 +686,7 @@ def main():
 
     executor = concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=_worker_init)
     futures = {}
+    last_title_state = None
 
     try:
         with Live(make_dashboard(worker_states, completed_days, total_days), refresh_per_second=4) as live:
@@ -701,9 +738,12 @@ def main():
                         error_msgs.append(err_line)
 
                 effective_total = (completed_days + len(futures)) if draining else total_days
-                pct = (completed_days / effective_total * 100.0) if effective_total > 0 else 0.0
-                prefix = "[DRAINING] " if draining else ""
-                set_terminal_tab_title(f"{prefix}WaveResonance: {completed_days}/{effective_total} ({pct:.1f}%)")
+                title_state = (completed_days, effective_total, draining)
+                if title_state != last_title_state:
+                    pct = (completed_days / effective_total * 100.0) if effective_total > 0 else 0.0
+                    prefix = "[DRAINING] " if draining else ""
+                    set_terminal_tab_title(f"{prefix}WaveResonance: {completed_days}/{effective_total} ({pct:.1f}%)")
+                    last_title_state = title_state
 
                 now_ts = time.time()
                 if (now_ts - last_state_flush) >= 2.0:
@@ -757,7 +797,8 @@ def main():
 
 def setup():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--date', type=str, required=True, help="Format: 'YYYY-MM-DD through YYYY-MM-DD'")
+    parser.add_argument('--date', type=str, default=None, help="Format: 'YYYY-MM-DD through YYYY-MM-DD'")
+    parser.add_argument('--batch_file', type=str, default=None, help="File of YYYY-MM-DD dates or ranges to process in one batch")
     parser.add_argument('-v_in', type=str, default="1.4", help="Input WaveAnalysis version")
     parser.add_argument('--workers', type=int, default=2, help="Number of days to process concurrently")
     parser.add_argument("-v", "--verbose", action="store_true", help="Print detailed step-by-step progress.")
